@@ -1,0 +1,125 @@
+name: Terraform Destroy - CloudOps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_DIR: ./cloudops-tf
+  TFSTATE_DIR: ./cloudops-tf/bootstrap
+  TFSTATE_RG: agentic-tfstate-rg
+  TFSTATE_STORAGE: agenticdevopstfstate
+  TFSTATE_CONTAINER: tfstate
+
+jobs:
+  bootstrap-state:
+    name: "1️⃣ Ensure Terraform State"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Bootstrap Terraform State
+        working-directory: ${{ env.TFSTATE_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          terraform init -input=false
+
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${TFSTATE_RG}"
+          STORAGE_ID="${RG_ID}/providers/Microsoft.Storage/storageAccounts/${TFSTATE_STORAGE}"
+          CONTAINER_ID="${STORAGE_ID}/blobServices/default/containers/${TFSTATE_CONTAINER}"
+
+          if az group show --name "$TFSTATE_RG" >/dev/null 2>&1; then
+            if ! terraform state show azurerm_resource_group.tfstate >/dev/null 2>&1; then
+              terraform import -input=false azurerm_resource_group.tfstate "$RG_ID"
+            fi
+          fi
+
+          if az storage account show --name "$TFSTATE_STORAGE" --resource-group "$TFSTATE_RG" >/dev/null 2>&1; then
+            if ! terraform state show azurerm_storage_account.tfstate >/dev/null 2>&1; then
+              terraform import -input=false azurerm_storage_account.tfstate "$STORAGE_ID"
+            fi
+          fi
+
+          if az storage container show --name "$TFSTATE_CONTAINER" --account-name "$TFSTATE_STORAGE" --auth-mode login >/dev/null 2>&1; then
+            if ! terraform state show azurerm_storage_container.tfstate >/dev/null 2>&1; then
+              terraform import -input=false azurerm_storage_container.tfstate "$CONTAINER_ID"
+            fi
+          fi
+
+          terraform apply -input=false -auto-approve
+
+  terraform-destroy:
+    name: "2️⃣ Destroy CloudOps Infrastructure"
+    needs: bootstrap-state
+    if: ${{ needs.bootstrap-state.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Destroy Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -input=false -destroy
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform destroy -input=false -auto-approve
+
+  destroy-state:
+    name: "3️⃣ Destroy Terraform State Storage"
+    needs: terraform-destroy
+    if: ${{ needs.terraform-destroy.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Destroy Bootstrap Terraform State
+        working-directory: ${{ env.TFSTATE_DIR }}
+        run: |
+          terraform init -input=false
+          terraform destroy -input=false -auto-approve
+
+      - name: Verify Terraform State Resource Group Deleted
+        shell: bash
+        run: |
+          if az group show --name "$TFSTATE_RG" >/dev/null 2>&1; then
+            echo "Terraform state resource group still exists: $TFSTATE_RG"
+            exit 1
+          fi
+          echo "Terraform state resources deleted successfully."
