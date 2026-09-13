@@ -198,41 +198,6 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false -auto-approve
 
-
-  # ============================================================
-  # STAGE 2 - TF DESTROY
-  # ============================================================
-  tf-destroy:
-    name: "2️⃣ TF Destroy"
-    needs: bootstrap-state
-    if: ${{ inputs.tf_destroy && needs.bootstrap-state.result == 'success' }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform init -input=false
-
-      - name: Terraform Destroy Plan
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform plan -input=false -destroy
-
-      - name: Terraform Destroy
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform destroy -input=false -auto-approve
-
-
   # ============================================================
   # STAGE 3 - BUILD IMAGE
   # ============================================================
