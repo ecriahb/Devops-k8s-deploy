@@ -1,4 +1,4 @@
-name: Deploy - CloudOps Dashboard
+name: Deploy - CloudOps Infra + Deploy
 
 on:
   workflow_dispatch:
@@ -40,10 +40,15 @@ env:
   ACR_PULL_SECRET: acr-pull-secret
 
 jobs:
-  terraform-infra:
-    name: "1️⃣ Terraform Infra"
-    if: ${{ inputs.terraform_infra && !inputs.tf_destroy }}
+
+  # ============================================================
+  # STAGE 0 - BOOTSTRAP TERRAFORM STATE
+  # ============================================================
+  bootstrap-state:
+    name: "0️⃣ Bootstrap Terraform State"
+    if: ${{ inputs.terraform_infra || inputs.tf_destroy }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,7 +63,124 @@ jobs:
 
       - name: Bootstrap Terraform State
         working-directory: ${{ env.TFSTATE_DIR }}
-        run: terraform init -input=false
+        shell: bash
+        run: |
+          set -e
+
+          echo "=============================================="
+          echo "BOOTSTRAP TERRAFORM STATE"
+          echo "=============================================="
+
+          terraform init -input=false
+
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+          RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${TFSTATE_RG}"
+          STORAGE_ID="${RG_ID}/providers/Microsoft.Storage/storageAccounts/${TFSTATE_STORAGE}"
+          CONTAINER_ID="${STORAGE_ID}/blobServices/default/containers/${TFSTATE_CONTAINER}"
+
+          echo "Subscription : $SUBSCRIPTION_ID"
+          echo "State RG     : $TFSTATE_RG"
+          echo "Storage      : $TFSTATE_STORAGE"
+          echo "Container    : $TFSTATE_CONTAINER"
+
+          echo ""
+          echo "Checking Terraform state resources..."
+
+          # ------------------------------------------------------
+          # RESOURCE GROUP
+          # ------------------------------------------------------
+          if az group show --name "$TFSTATE_RG" >/dev/null 2>&1; then
+            echo "Resource Group already exists: $TFSTATE_RG"
+
+            if ! terraform state show azurerm_resource_group.tfstate >/dev/null 2>&1; then
+              echo "Importing Resource Group..."
+              terraform import -input=false \
+                azurerm_resource_group.tfstate \
+                "$RG_ID"
+            else
+              echo "Resource Group already managed by Terraform."
+            fi
+          else
+            echo "Resource Group does not exist. Terraform will create it."
+          fi
+
+          # ------------------------------------------------------
+          # STORAGE ACCOUNT
+          # ------------------------------------------------------
+          if az storage account show \
+              --name "$TFSTATE_STORAGE" \
+              --resource-group "$TFSTATE_RG" >/dev/null 2>&1; then
+
+            echo "Storage Account already exists: $TFSTATE_STORAGE"
+
+            if ! terraform state show azurerm_storage_account.tfstate >/dev/null 2>&1; then
+              echo "Importing Storage Account..."
+              terraform import -input=false \
+                azurerm_storage_account.tfstate \
+                "$STORAGE_ID"
+            else
+              echo "Storage Account already managed by Terraform."
+            fi
+          else
+            echo "Storage Account does not exist. Terraform will create it."
+          fi
+
+          # ------------------------------------------------------
+          # STORAGE CONTAINER
+          # ------------------------------------------------------
+          if az storage container show \
+              --name "$TFSTATE_CONTAINER" \
+              --account-name "$TFSTATE_STORAGE" \
+              --auth-mode login >/dev/null 2>&1; then
+
+            echo "Storage Container already exists: $TFSTATE_CONTAINER"
+
+            if ! terraform state show azurerm_storage_container.tfstate >/dev/null 2>&1; then
+              echo "Importing Storage Container..."
+              terraform import -input=false \
+                azurerm_storage_container.tfstate \
+                "$CONTAINER_ID"
+            else
+              echo "Storage Container already managed by Terraform."
+            fi
+          else
+            echo "Storage Container does not exist. Terraform will create it."
+          fi
+
+          echo ""
+          echo "Applying Bootstrap Terraform..."
+
+          terraform apply \
+            -input=false \
+            -auto-approve
+
+          echo ""
+          echo "=============================================="
+          echo "BOOTSTRAP TERRAFORM STATE READY"
+          echo "=============================================="
+
+
+  # ============================================================
+  # STAGE 1 - TERRAFORM INFRA
+  # ============================================================
+  terraform-infra:
+    name: "1️⃣ Terraform Infra"
+    needs: bootstrap-state
+    if: ${{ inputs.terraform_infra && !inputs.tf_destroy && needs.bootstrap-state.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
       - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
@@ -76,10 +198,16 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -input=false -auto-approve
 
+
+  # ============================================================
+  # STAGE 2 - TF DESTROY
+  # ============================================================
   tf-destroy:
     name: "2️⃣ TF Destroy"
-    if: ${{ inputs.tf_destroy }}
+    needs: bootstrap-state
+    if: ${{ inputs.tf_destroy && needs.bootstrap-state.result == 'success' }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,51 +232,88 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform destroy -input=false -auto-approve
 
+
+  # ============================================================
+  # STAGE 3 - BUILD IMAGE
+  # ============================================================
   build-image:
     name: "3️⃣ Build Image"
     needs: terraform-infra
     if: ${{ always() && inputs.build_image && !inputs.tf_destroy && (needs.terraform-infra.result == 'success' || needs.terraform-infra.result == 'skipped') }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
       - name: Login to ACR
         run: az acr login --name "$ACR_NAME"
+
       - name: Build and Push Incident Create
         run: |
-          docker build --platform linux/amd64 -t "$ACR_NAME.azurecr.io/incident-create:${GITHUB_SHA}" -t "$ACR_NAME.azurecr.io/incident-create:latest" ./backend/incidents/create
+          docker build --platform linux/amd64 \
+            -t "$ACR_NAME.azurecr.io/incident-create:${GITHUB_SHA}" \
+            -t "$ACR_NAME.azurecr.io/incident-create:latest" \
+            ./backend/incidents/create
+
           docker push "$ACR_NAME.azurecr.io/incident-create:${GITHUB_SHA}"
           docker push "$ACR_NAME.azurecr.io/incident-create:latest"
+
       - name: Build and Push Incident List
         run: |
-          docker build --platform linux/amd64 -t "$ACR_NAME.azurecr.io/incident-list:${GITHUB_SHA}" -t "$ACR_NAME.azurecr.io/incident-list:latest" ./backend/incidents/list
+          docker build --platform linux/amd64 \
+            -t "$ACR_NAME.azurecr.io/incident-list:${GITHUB_SHA}" \
+            -t "$ACR_NAME.azurecr.io/incident-list:latest" \
+            ./backend/incidents/list
+
           docker push "$ACR_NAME.azurecr.io/incident-list:${GITHUB_SHA}"
           docker push "$ACR_NAME.azurecr.io/incident-list:latest"
+
       - name: Build and Push Incident Resolve
         run: |
-          docker build --platform linux/amd64 -t "$ACR_NAME.azurecr.io/incident-resolve:${GITHUB_SHA}" -t "$ACR_NAME.azurecr.io/incident-resolve:latest" ./backend/incidents/resolve
+          docker build --platform linux/amd64 \
+            -t "$ACR_NAME.azurecr.io/incident-resolve:${GITHUB_SHA}" \
+            -t "$ACR_NAME.azurecr.io/incident-resolve:latest" \
+            ./backend/incidents/resolve
+
           docker push "$ACR_NAME.azurecr.io/incident-resolve:${GITHUB_SHA}"
           docker push "$ACR_NAME.azurecr.io/incident-resolve:latest"
+
       - name: Build and Push AI RCA
         run: |
-          docker build --platform linux/amd64 -t "$ACR_NAME.azurecr.io/ai-rca:${GITHUB_SHA}" -t "$ACR_NAME.azurecr.io/ai-rca:latest" ./backend/AIRCAService
+          docker build --platform linux/amd64 \
+            -t "$ACR_NAME.azurecr.io/ai-rca:${GITHUB_SHA}" \
+            -t "$ACR_NAME.azurecr.io/ai-rca:latest" \
+            ./backend/AIRCAService
+
           docker push "$ACR_NAME.azurecr.io/ai-rca:${GITHUB_SHA}"
           docker push "$ACR_NAME.azurecr.io/ai-rca:latest"
+
       - name: Build and Push Frontend
         run: |
-          docker build --platform linux/amd64 -t "$ACR_NAME.azurecr.io/cloudops-ui:${GITHUB_SHA}" -t "$ACR_NAME.azurecr.io/cloudops-ui:latest" ./frontend
+          docker build --platform linux/amd64 \
+            -t "$ACR_NAME.azurecr.io/cloudops-ui:${GITHUB_SHA}" \
+            -t "$ACR_NAME.azurecr.io/cloudops-ui:latest" \
+            ./frontend
+
           docker push "$ACR_NAME.azurecr.io/cloudops-ui:${GITHUB_SHA}"
           docker push "$ACR_NAME.azurecr.io/cloudops-ui:latest"
 
+
+  # ============================================================
+  # STAGE 4 - K8S DEPLOY
+  # ============================================================
   k8s-deploy:
     name: "4️⃣ K8s Deploy"
     needs: [terraform-infra, build-image]
     if: ${{ always() && inputs.k8s_deploy && !inputs.tf_destroy && (needs.terraform-infra.result == 'success' || needs.terraform-infra.result == 'skipped') && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -163,7 +328,10 @@ jobs:
 
       - name: Get AKS Credentials
         run: |
-          az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
+          az aks get-credentials \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER" \
+            --overwrite-existing
 
       - name: Verify AKS
         run: |
@@ -179,26 +347,49 @@ jobs:
         shell: bash
         run: |
           SQL_CONNECTION_STRING="$(terraform output -raw sql_connection_string)"
+
           test -n "$SQL_CONNECTION_STRING"
-          kubectl create secret generic agentic-sql-secret --from-literal=CONNECTION_STRING="$SQL_CONNECTION_STRING" --namespace=default --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic agentic-sql-secret \
+            --from-literal=CONNECTION_STRING="$SQL_CONNECTION_STRING" \
+            --namespace=default \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
 
       - name: Login to ACR
         run: az acr login --name "$ACR_NAME"
 
       - name: Create / Update ACR imagePullSecret
         run: |
-          ACR_USERNAME=$(az acr credential show --name "$ACR_NAME" --query username -o tsv)
-          ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" --query 'passwords[0].value' -o tsv)
-          kubectl create secret docker-registry "$ACR_PULL_SECRET" --docker-server="$ACR_NAME.azurecr.io" --docker-username="$ACR_USERNAME" --docker-password="$ACR_PASSWORD" --namespace=default --dry-run=client -o yaml | kubectl apply -f -
+          ACR_USERNAME=$(az acr credential show \
+            --name "$ACR_NAME" \
+            --query username \
+            -o tsv)
+
+          ACR_PASSWORD=$(az acr credential show \
+            --name "$ACR_NAME" \
+            --query 'passwords[0].value' \
+            -o tsv)
+
+          kubectl create secret docker-registry "$ACR_PULL_SECRET" \
+            --docker-server="$ACR_NAME.azurecr.io" \
+            --docker-username="$ACR_USERNAME" \
+            --docker-password="$ACR_PASSWORD" \
+            --namespace=default \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
 
       - name: Apply Backend Manifests
         run: |
           kubectl apply -f ./backend/incidents/create/manifests/deployment.yaml
           kubectl apply -f ./backend/incidents/create/manifests/service.yaml
+
           kubectl apply -f ./backend/incidents/list/manifests/deployment.yaml
           kubectl apply -f ./backend/incidents/list/manifests/service.yaml
+
           kubectl apply -f ./backend/incidents/resolve/manifests/deployment.yaml
           kubectl apply -f ./backend/incidents/resolve/manifests/service.yaml
+
           kubectl apply -f ./backend/AIRCAService/manifests/ai-rca.yaml
 
       - name: Apply Frontend Manifests
@@ -209,11 +400,25 @@ jobs:
       - name: Set Immutable Image Tags
         if: ${{ inputs.build_image }}
         run: |
-          kubectl -n default set image deployment/agentic-incident-create agentic-incident-create="$ACR_NAME.azurecr.io/incident-create:${GITHUB_SHA}"
-          kubectl -n default set image deployment/agentic-incident-list agentic-incident-list="$ACR_NAME.azurecr.io/incident-list:${GITHUB_SHA}"
-          kubectl -n default set image deployment/agentic-incident-resolve agentic-incident-resolve="$ACR_NAME.azurecr.io/incident-resolve:${GITHUB_SHA}"
-          kubectl -n default set image deployment/ai-rca ai-rca="$ACR_NAME.azurecr.io/ai-rca:${GITHUB_SHA}"
-          kubectl -n default set image deployment/agentic-cloudops-ui agentic-cloudops-ui="$ACR_NAME.azurecr.io/cloudops-ui:${GITHUB_SHA}"
+          kubectl -n default set image \
+            deployment/agentic-incident-create \
+            agentic-incident-create="$ACR_NAME.azurecr.io/incident-create:${GITHUB_SHA}"
+
+          kubectl -n default set image \
+            deployment/agentic-incident-list \
+            agentic-incident-list="$ACR_NAME.azurecr.io/incident-list:${GITHUB_SHA}"
+
+          kubectl -n default set image \
+            deployment/agentic-incident-resolve \
+            agentic-incident-resolve="$ACR_NAME.azurecr.io/incident-resolve:${GITHUB_SHA}"
+
+          kubectl -n default set image \
+            deployment/ai-rca \
+            ai-rca="$ACR_NAME.azurecr.io/ai-rca:${GITHUB_SHA}"
+
+          kubectl -n default set image \
+            deployment/agentic-cloudops-ui \
+            agentic-cloudops-ui="$ACR_NAME.azurecr.io/cloudops-ui:${GITHUB_SHA}"
 
       - name: Wait for Rollouts
         run: |
@@ -227,7 +432,10 @@ jobs:
         run: |
           echo "=== Deployments ==="
           kubectl get deployments -o wide
+
           echo "=== Pods ==="
           kubectl get pods -o wide
+
           echo "=== Services ==="
           kubectl get svc -o wide
+```
