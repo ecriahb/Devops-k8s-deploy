@@ -57,44 +57,108 @@ jobs:
             -auto-approve
 
   # ============================================================
-  # STAGE 2 - DESTROY BOOTSTRAP TERRAFORM STATE
+  # STAGE 2 - DELETE TERRAFORM STATE RESOURCE GROUP
   # ============================================================
   bootstrap-destroy:
-    name: "2️⃣ Destroy Terraform State Storage"
+    name: "2️⃣ Delete Terraform State Storage"
     needs: terraform-destroy
     if: ${{ needs.terraform-destroy.result == 'success' }}
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Bootstrap Terraform Init
-        working-directory: ${{ env.TFSTATE_DIR }}
+      - name: Check Terraform State Resource Group
         run: |
-          terraform init -input=false
+          echo "Checking Terraform state resource group..."
 
-      - name: Bootstrap Terraform Destroy
-        working-directory: ${{ env.TFSTATE_DIR }}
-        run: |
-          terraform destroy \
-            -input=false \
-            -auto-approve
+          if az group show \
+            --name "$TFSTATE_RG" \
+            >/dev/null 2>&1; then
 
-      # ========================================================
-      # FINAL SAFETY CHECK
-      # ========================================================
-      - name: Verify Terraform State Resource Group Deleted
+            echo "Terraform state resource group exists:"
+            echo "$TFSTATE_RG"
+
+          else
+
+            echo "Terraform state resource group does not exist."
+            echo "Nothing to delete."
+
+          fi
+
+      - name: Delete Terraform State Resource Group
         run: |
+          if az group show \
+            --name "$TFSTATE_RG" \
+            >/dev/null 2>&1; then
+
+            echo "Deleting Terraform state resource group..."
+            echo "$TFSTATE_RG"
+
+            az group delete \
+              --name "$TFSTATE_RG" \
+              --yes \
+              --no-wait
+
+          else
+
+            echo "Terraform state resource group already deleted."
+
+          fi
+
+      - name: Wait For Terraform State Resource Group Deletion
+        run: |
+          echo "Waiting for Terraform state resource group deletion..."
+
+          for i in {1..60}; do
+
+            if az group show \
+              --name "$TFSTATE_RG" \
+              >/dev/null 2>&1; then
+
+              echo "Still exists... waiting 10 seconds."
+              sleep 10
+
+            else
+
+              echo "✅ Terraform state resource group deleted."
+              exit 0
+
+            fi
+
+          done
+
+          echo "❌ Terraform state resource group was not deleted within timeout."
+          exit 1
+
+      - name: Final Azure Cleanup Verification
+        run: |
+          echo "=============================================="
+          echo "        AZURE DESTROY VERIFICATION"
+          echo "=============================================="
+
+          echo ""
+          echo "Checking main resource group..."
+
+          if az group show \
+            --name "$RESOURCE_GROUP" \
+            >/dev/null 2>&1; then
+
+            echo "❌ Main resource group still exists:"
+            echo "$RESOURCE_GROUP"
+            exit 1
+
+          else
+
+            echo "✅ Main resource group deleted."
+
+          fi
+
+          echo ""
           echo "Checking Terraform state resource group..."
 
           if az group show \
@@ -103,40 +167,15 @@ jobs:
 
             echo "❌ Terraform state resource group still exists:"
             echo "$TFSTATE_RG"
-
             exit 1
+
+          else
+
+            echo "✅ Terraform state resource group deleted."
+
           fi
 
-          echo "✅ Terraform state resource group deleted successfully."
-
-      - name: Verify Main Resource Group Deleted
-        run: |
-          echo "Checking main resource group..."
-
-          if az group show \
-            --name "$RESOURCE_GROUP" \
-            >/dev/null 2>&1; then
-
-            echo "⚠️ Main resource group still exists:"
-            echo "$RESOURCE_GROUP"
-
-            exit 1
-          fi
-
-          echo "✅ Main Azure infrastructure cleaned successfully."
-
-      - name: Final Cleanup Summary
-        run: |
-          echo "=============================================="
-          echo "      AZURE DESTROY COMPLETED"
-          echo "=============================================="
           echo ""
-          echo "Main Resource Group : $RESOURCE_GROUP"
-          echo "TF State RG          : $TFSTATE_RG"
-          echo "TF State Storage     : $TFSTATE_STORAGE"
-          echo "TF State Container   : $TFSTATE_CONTAINER"
-          echo ""
-          echo "✅ CloudOps infrastructure deleted"
-          echo "✅ Terraform state storage deleted"
-          echo "✅ Azure cleanup completed"
+          echo "=============================================="
+          echo "       ✅ AZURE CLEANUP COMPLETED"
           echo "=============================================="
