@@ -1,4 +1,4 @@
-name: Terraform Destroy - CloudOps
+name: Destroy - CloudOps Azure Infrastructure
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ permissions:
   id-token: write
 
 env:
+  RESOURCE_GROUP: agentic-devops-rg
   TF_DIR: ./cloudops-tf
   TFSTATE_DIR: ./cloudops-tf/bootstrap
   TFSTATE_RG: agentic-tfstate-rg
@@ -15,60 +16,16 @@ env:
   TFSTATE_CONTAINER: tfstate
 
 jobs:
-  bootstrap-state:
-    name: "1️⃣ Ensure Terraform State"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Bootstrap Terraform State
-        working-directory: ${{ env.TFSTATE_DIR }}
-        shell: bash
-        run: |
-          set -e
-
-          terraform init -input=false
-
-          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-          RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${TFSTATE_RG}"
-          STORAGE_ID="${RG_ID}/providers/Microsoft.Storage/storageAccounts/${TFSTATE_STORAGE}"
-          CONTAINER_ID="${STORAGE_ID}/blobServices/default/containers/${TFSTATE_CONTAINER}"
-
-          if az group show --name "$TFSTATE_RG" >/dev/null 2>&1; then
-            if ! terraform state show azurerm_resource_group.tfstate >/dev/null 2>&1; then
-              terraform import -input=false azurerm_resource_group.tfstate "$RG_ID"
-            fi
-          fi
-
-          if az storage account show --name "$TFSTATE_STORAGE" --resource-group "$TFSTATE_RG" >/dev/null 2>&1; then
-            if ! terraform state show azurerm_storage_account.tfstate >/dev/null 2>&1; then
-              terraform import -input=false azurerm_storage_account.tfstate "$STORAGE_ID"
-            fi
-          fi
-
-          if az storage container show --name "$TFSTATE_CONTAINER" --account-name "$TFSTATE_STORAGE" --auth-mode login >/dev/null 2>&1; then
-            if ! terraform state show azurerm_storage_container.tfstate >/dev/null 2>&1; then
-              terraform import -input=false azurerm_storage_container.tfstate "$CONTAINER_ID"
-            fi
-          fi
-
-          terraform apply -input=false -auto-approve
-
+  # ============================================================
+  # STAGE 1 - DESTROY MAIN TERRAFORM INFRA
+  # ============================================================
   terraform-destroy:
-    name: "2️⃣ Destroy CloudOps Infrastructure"
-    needs: bootstrap-state
-    if: ${{ needs.bootstrap-state.result == 'success' }}
+    name: "1️⃣ Destroy CloudOps Infrastructure"
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -82,22 +39,34 @@ jobs:
 
       - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
-        run: terraform init -input=false
+        run: |
+          terraform init -input=false
 
       - name: Terraform Destroy Plan
         working-directory: ${{ env.TF_DIR }}
-        run: terraform plan -input=false -destroy
+        run: |
+          terraform plan \
+            -input=false \
+            -destroy
 
       - name: Terraform Destroy
         working-directory: ${{ env.TF_DIR }}
-        run: terraform destroy -input=false -auto-approve
+        run: |
+          terraform destroy \
+            -input=false \
+            -auto-approve
 
-  destroy-state:
-    name: "3️⃣ Destroy Terraform State Storage"
+  # ============================================================
+  # STAGE 2 - DESTROY BOOTSTRAP TERRAFORM STATE
+  # ============================================================
+  bootstrap-destroy:
+    name: "2️⃣ Destroy Terraform State Storage"
     needs: terraform-destroy
     if: ${{ needs.terraform-destroy.result == 'success' }}
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -109,17 +78,65 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Destroy Bootstrap Terraform State
+      - name: Bootstrap Terraform Init
         working-directory: ${{ env.TFSTATE_DIR }}
         run: |
           terraform init -input=false
-          terraform destroy -input=false -auto-approve
 
-      - name: Verify Terraform State Resource Group Deleted
-        shell: bash
+      - name: Bootstrap Terraform Destroy
+        working-directory: ${{ env.TFSTATE_DIR }}
         run: |
-          if az group show --name "$TFSTATE_RG" >/dev/null 2>&1; then
-            echo "Terraform state resource group still exists: $TFSTATE_RG"
+          terraform destroy \
+            -input=false \
+            -auto-approve
+
+      # ========================================================
+      # FINAL SAFETY CHECK
+      # ========================================================
+      - name: Verify Terraform State Resource Group Deleted
+        run: |
+          echo "Checking Terraform state resource group..."
+
+          if az group show \
+            --name "$TFSTATE_RG" \
+            >/dev/null 2>&1; then
+
+            echo "❌ Terraform state resource group still exists:"
+            echo "$TFSTATE_RG"
+
             exit 1
           fi
-          echo "Terraform state resources deleted successfully."
+
+          echo "✅ Terraform state resource group deleted successfully."
+
+      - name: Verify Main Resource Group Deleted
+        run: |
+          echo "Checking main resource group..."
+
+          if az group show \
+            --name "$RESOURCE_GROUP" \
+            >/dev/null 2>&1; then
+
+            echo "⚠️ Main resource group still exists:"
+            echo "$RESOURCE_GROUP"
+
+            exit 1
+          fi
+
+          echo "✅ Main Azure infrastructure cleaned successfully."
+
+      - name: Final Cleanup Summary
+        run: |
+          echo "=============================================="
+          echo "      AZURE DESTROY COMPLETED"
+          echo "=============================================="
+          echo ""
+          echo "Main Resource Group : $RESOURCE_GROUP"
+          echo "TF State RG          : $TFSTATE_RG"
+          echo "TF State Storage     : $TFSTATE_STORAGE"
+          echo "TF State Container   : $TFSTATE_CONTAINER"
+          echo ""
+          echo "✅ CloudOps infrastructure deleted"
+          echo "✅ Terraform state storage deleted"
+          echo "✅ Azure cleanup completed"
+          echo "=============================================="
